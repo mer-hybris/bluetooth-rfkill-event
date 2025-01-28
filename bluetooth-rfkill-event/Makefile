@@ -28,7 +28,7 @@ install:
 	mkdir -p $(INSTALL_ROOT)/usr/sbin
 	install bluetooth_rfkill_event $(INSTALL_ROOT)/usr/sbin
 	mkdir -p $(INSTALL_ROOT)/usr/lib/systemd/system
-	install bluetooth-rfkill-event.service $(INSTALL_ROOT)/usr/lib/systemd/system
+	install -m 644 bluetooth-rfkill-event.service $(INSTALL_ROOT)/usr/lib/systemd/system
 	mkdir -p $(INSTALL_ROOT)/usr/lib/systemd/system/network.target.wants
 	ln -s ../bluetooth-rfkill-event.service $(INSTALL_ROOT)/usr/lib/systemd/system/network.target.wants/bluetooth-rfkill-event.service
 	mkdir -p $(INSTALL_ROOT)/etc/bluetooth-rfkill-event
