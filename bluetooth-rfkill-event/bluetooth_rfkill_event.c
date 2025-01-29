@@ -91,6 +91,8 @@ char default_bd_addr[18];
 /* attempt to set hci dev UP */
 #define MAX_RETRY 10
 
+static pid_t last_patchram_pid = 0;
+
 enum rfkill_operation {
     RFKILL_OP_ADD = 0,
     RFKILL_OP_DEL,
@@ -942,6 +944,13 @@ void free_hci()
     } else {
         INFO("No %s process to be found", hciattach);
     }
+    if (last_patchram_pid) {
+           int status;
+           if (waitpid(last_patchram_pid, &status, WNOHANG) != last_patchram_pid) {
+               INFO("Could not wait for pid %d", last_patchram_pid);
+        }
+        last_patchram_pid = 0;
+    }
 }
 
 void attach_hci()
@@ -972,7 +981,7 @@ void attach_hci()
     }
 
     if (main_opts.no_wait) {
-        if (fork() == 0) {
+        if ((last_patchram_pid = fork()) == 0) {
             char *argv[4] = {
                 "/bin/sh",
                 "-c",
