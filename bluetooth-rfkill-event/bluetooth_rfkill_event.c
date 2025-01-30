@@ -51,6 +51,7 @@
 
 enum patcher_type {
     PATCHER_BRCM_PATCHRAM_PLUS,
+    PATCHER_BRCM_PATCHRAM_PLUS1,
     PATCHER_HCIATTACH,
     PATCHER_COUNT
 };
@@ -65,6 +66,7 @@ static void hciattach_cmdline();
 
 static const struct patcher_impl patcher_impl[PATCHER_COUNT] = {
     { "brcm_patchram_plus", brcm_patchram_plus_cmdline },
+    { "brcm_patchram_plus1", brcm_patchram_plus_cmdline },
     { "hciattach",          hciattach_cmdline }
 };
 
@@ -76,6 +78,7 @@ enum rfkill_switch_type {
 /* list of all supported chips:
    name is defined in the kernel driver implementing rfkill interface for power */
 #define BCM_RFKILL_NAME "bcm43xx Bluetooth\n"
+#define BCM_RFKILL_NAME1 "bt_default\n"
 #define BCM_43341_UART_DEV "/dev/ttyMFD0"
 #define BD_ADD_FACTORY_FILE "/factory/bluetooth_address"
 char factory_bd_add[18];
@@ -87,6 +90,8 @@ char default_bd_addr[18];
 
 /* attempt to set hci dev UP */
 #define MAX_RETRY 10
+
+static pid_t last_patchram_pid = 0;
 
 enum rfkill_operation {
     RFKILL_OP_ADD = 0,
@@ -160,6 +165,7 @@ struct main_opts {
     /* configure BD address */
     gboolean    set_bd;
     char*       bd_add;
+    gboolean    no_bdaddr;
     /* File containing bdaddr */
     char*       bdaddr_file;
     /* set SCO routing for audio interface */
@@ -174,6 +180,10 @@ struct main_opts {
     gboolean    no_flush;
     /* Enable lpm with hciattach */
     gboolean    use_lpm;
+    /* Write 0 then 1 to /proc/bluetooth/sleep/btwrite before downloading the FW */
+    gboolean    bt_reset_btwrite;
+    /* Don't wait for the patcher to finish */
+    gboolean    no_wait;
 };
 
 struct main_opts main_opts;
@@ -194,7 +204,10 @@ static const char * const supported_options[] = {
     "exec_timeout",
     "bdaddr",
     "no_flush",
-    "use_lpm"
+    "use_lpm",
+    "no_bdaddr",
+    "bt_reset_btwrite",
+    "no_wait"
 };
 
 static int log_debug = 0;
@@ -537,12 +550,15 @@ void init_config()
     main_opts.set_baud_rate = FALSE;
     main_opts.dl_patch = FALSE;
     main_opts.set_bd = FALSE;
+    main_opts.no_bdaddr = FALSE;
     main_opts.set_scopcm = FALSE;
     main_opts.set_tosleep = FALSE;
     main_opts.tosleep = NULL;
     main_opts.exec_timeout = 0;
     main_opts.no_flush = FALSE;
     main_opts.use_lpm = FALSE;
+    main_opts.bt_reset_btwrite = FALSE;
+    main_opts.no_wait = FALSE;
 }
 
 GKeyFile *load_config(const char *file)
@@ -736,11 +752,32 @@ void parse_config(GKeyFile *config)
         main_opts.no_flush = boolean;
     }
 
+    boolean = g_key_file_get_boolean(config, "General", "no_bdaddr", &err);
+    if (err) {
+        g_clear_error(&err);
+    } else {
+        main_opts.no_bdaddr = boolean;
+    }
+
     boolean = g_key_file_get_boolean(config, "General", "use_lpm", &err);
     if (err) {
         g_clear_error(&err);
     } else {
         main_opts.use_lpm = boolean;
+    }
+
+    boolean = g_key_file_get_boolean(config, "General", "bt_reset_btwrite", &err);
+    if (err) {
+        g_clear_error(&err);
+    } else {
+        main_opts.bt_reset_btwrite = boolean;
+    }
+
+    boolean = g_key_file_get_boolean(config, "General", "no_wait", &err);
+    if (err) {
+        g_clear_error(&err);
+    } else {
+        main_opts.no_wait = boolean;
     }
 }
 
@@ -831,7 +868,7 @@ static void brcm_patchram_plus_cmdline()
     if ((cur < end) && (main_opts.dl_patch)) {
         cur += snprintf(cur, end-cur," --patchram %s", main_opts.fw_patch);
     }
-    if ((cur < end) && (main_opts.set_bd)) {
+    if ((cur < end) && (main_opts.set_bd && !main_opts.no_bdaddr)) {
         cur += snprintf(cur, end-cur," --bd_addr %s", main_opts.bd_add);
     }
     if ((cur < end) && (main_opts.set_scopcm)) {
@@ -907,23 +944,64 @@ void free_hci()
     } else {
         INFO("No %s process to be found", hciattach);
     }
+    if (last_patchram_pid) {
+           int status;
+           if (waitpid(last_patchram_pid, &status, WNOHANG) != last_patchram_pid) {
+               INFO("Could not wait for pid %d", last_patchram_pid);
+        }
+        last_patchram_pid = 0;
+    }
 }
 
 void attach_hci()
 {
     char hci_execute[PATH_MAX * 2];
     int r;
+    FILE *fp_btwrite = NULL;
 
     DEBUG("");
 
     snprintf(hci_execute, sizeof(hci_execute), "%s %s", hciattach, hciattach_options);
 
-    r = system_timeout(hci_execute);
-    INFO("executing %s %s", hci_execute,
-         (WIFEXITED(r) && !WEXITSTATUS(r)) ? "succeeded" : "failed");
+    if (main_opts.bt_reset_btwrite) {
+        fp_btwrite = fopen("/proc/bluetooth/sleep/btwrite", "w");
+        if (!fp_btwrite) {
+            fprintf(stderr, "Failed to open /proc/bluetooth/sleep/btwrite\n");
+        } else {
+            fwrite("0\n", 3, 1, fp_btwrite);
+            fflush(fp_btwrite);
+            // sleep 500ms
+            usleep(500*1000);
+            fwrite("1\n", 3, 1, fp_btwrite);
+            fflush(fp_btwrite);
+            // sleep 500ms
+            usleep(500*1000);
+        }
+        fclose(fp_btwrite);
+    }
 
-    if (!WIFEXITED(r) || WEXITSTATUS(r))
-        FATAL("Failed to execute %s, exiting", hci_execute);
+    if (main_opts.no_wait) {
+        if ((last_patchram_pid = fork()) == 0) {
+            char *argv[4] = {
+                "/bin/sh",
+                "-c",
+                hci_execute,
+                NULL
+            };
+            if (execv("/bin/sh", argv) < 0) {
+                WARN("Can't execute command '%s': %s(%d)",
+                 hci_execute, strerror(errno), errno);
+            }
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        r = system_timeout(hci_execute);
+        INFO("executing %s %s", hci_execute,
+             (WIFEXITED(r) && !WEXITSTATUS(r)) ? "succeeded" : "failed");
+
+        if (!WIFEXITED(r) || WEXITSTATUS(r))
+            FATAL("Failed to execute %s, exiting", hci_execute);
+    }
 
     /* remember if hci device has been registered (in case conf file is changed) */
     hci_dev_registered = main_opts.enable_hci;
@@ -1066,7 +1144,7 @@ static int rfkill_switch_add(struct rfkill_event *event)
     }
 
     /* based on chip read its config file, if any, and define the hciattach utility used to dowload the patch */
-    if (!strncmp(BCM_RFKILL_NAME, sysname, sizeof(BCM_RFKILL_NAME))) {
+    if (!strncmp(BCM_RFKILL_NAME, sysname, sizeof(BCM_RFKILL_NAME)) || !strncmp(BCM_RFKILL_NAME1, sysname, sizeof(BCM_RFKILL_NAME1))) {
 	read_config(config_file);
 	snprintf(hciattach, sizeof(hciattach), patcher_impl[main_opts.patcher].name);
 	type = BT_PWR;
